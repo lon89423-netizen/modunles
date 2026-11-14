@@ -54,8 +54,12 @@ FUNCTIONS = [
     ("legsToHead", "Legs To Head"),
     ("fixLimbs", "Fix Tay Chan Binh Thuong"),
     ("resetAll", "Reset Tat Ca Ve Ban Goc"),
+    ("hexEditBone", "Hex Edit Bone"),
     ("checksum", "Fix Checksum")
 ]
+
+BONE_NAME_RE = re.compile(r"^bone_[A-Za-z0-9_~.\-]+$")
+BONE_MARK = b"bone_"
 
 
 def read_float(data, offset):
@@ -122,6 +126,41 @@ def parse_binary(data):
     return bones
 
 
+def scan_bone_names(data):
+    """Quet MOI chuoi bone_<ten> trong file, tra ve list
+    {offset, original, current}. Giong het HTML."""
+    out = []
+    n = len(BONE_MARK)
+    i = 0
+    size = len(data)
+
+    while i <= size - n:
+        if data[i:i + n] != BONE_MARK:
+            i += 1
+            continue
+
+        j = i + n
+        while j < size:
+            b = data[j]
+            is_name_char = (
+                (0x30 <= b <= 0x39) or
+                (0x41 <= b <= 0x5A) or
+                (0x61 <= b <= 0x7A) or
+                b in (0x5F, 0x7E, 0x2E, 0x2D)
+            )
+            if not is_name_char:
+                break
+            j += 1
+
+        raw = data[i:j].decode("utf-8", errors="ignore")
+        if BONE_NAME_RE.match(raw) and len(raw) > n:
+            out.append({"offset": i, "original": raw, "current": raw})
+
+        i = j if j > i + n else i + 1
+
+    return out
+
+
 def select_bones(bones, function):
     if function in ("scaleFull", "moveFull", "checksum", "fixLimbs", "resetAll"):
         return bones
@@ -146,6 +185,25 @@ def fix_checksum(data):
     return data
 
 
+def rebuild_with_replacements(data, replacements):
+    """replacements: list {offset, original, current}.
+    Cat + chen + noi phan duoi. Do dai file co the thay doi."""
+    replacements = [r for r in replacements if r["current"] != r["original"]]
+    replacements.sort(key=lambda r: r["offset"])
+
+    chunks = []
+    cursor = 0
+    for r in replacements:
+        if r["offset"] < cursor:
+            continue
+        chunks.append(data[cursor:r["offset"]])
+        chunks.append(r["current"].encode("utf-8"))
+        cursor = r["offset"] + len(r["original"].encode("utf-8"))
+    chunks.append(data[cursor:])
+
+    return bytearray(b"".join(chunks))
+
+
 def process_data(original, bones, function, value=None):
     data = bytearray(original)
 
@@ -153,14 +211,10 @@ def process_data(original, bones, function, value=None):
         return fix_checksum(data), 1
 
     if function == "resetAll":
-        # Tra ve DUNG bytes goc nhu luc chua dung den.
-        # Van tinh lai checksum de chac chan file hop le.
         restored = fix_checksum(bytearray(original))
         return restored, len(bones)
 
     if function == "legsToHead":
-        # Tach rieng head va leg, loai bone khong co pos,
-        # va loai bone "head" bi nham la leg (tranh trung keyword).
         heads = [b for b in bones
                  if b["pos"] is not None
                  and any(w in b["name"] for w in HEAD_KEYWORDS)
@@ -170,12 +224,9 @@ def process_data(original, bones, function, value=None):
                 and any(w in b["name"] for w in LEG_KEYWORDS)]
 
         if not heads or not legs:
-            return fix_checksum(data), 0  # khong co gi de doi
+            return fix_checksum(data), 0
 
         changed = 0
-
-        # Neu so luong bang nhau: hoan doi theo cap.
-        # Neu lech: lay head dau tien lam chuan, doi Y voi TAT CA leg.
         if len(heads) == len(legs):
             pairs = list(zip(heads, legs))
         else:
@@ -190,7 +241,6 @@ def process_data(original, bones, function, value=None):
             ly = read_float(data, l["pos"] + 4)
             if hy is None or ly is None:
                 continue
-            # Chi doi Y (offset +4), giu nguyen X va Z
             write_float(data, h["pos"] + 4, ly)
             write_float(data, l["pos"] + 4, hy)
             changed += 1
@@ -280,6 +330,36 @@ class ValueModal(discord.ui.Modal):
             )
 
 
+class BoneEditModal(discord.ui.Modal):
+    def __init__(self, view, bone_index):
+        super().__init__(title="Sua Ten Bone")
+        self.parent_view = view
+        self.bone_index = bone_index
+
+        bone = view.bones_scanned[bone_index]
+
+        self.new_name = discord.ui.TextInput(
+            label=f"Sua: {bone['original'][:40]}",
+            placeholder="Vi du: bone_Head",
+            default=bone["current"],
+            required=True,
+            max_length=64
+        )
+        self.add_item(self.new_name)
+
+    async def on_submit(self, interaction):
+        val = str(self.new_name.value).strip()
+
+        if not BONE_NAME_RE.match(val):
+            await interaction.response.send_message(
+                "Ten khong hop le! Phai bat dau bang 'bone_' va chi gom chu, so, _ ~ . -",
+                ephemeral=True
+            )
+            return
+
+        await self.parent_view.apply_bone_edit(interaction, self.bone_index, val)
+
+
 class FunctionSelect(discord.ui.Select):
     def __init__(self):
         options = [
@@ -295,6 +375,176 @@ class FunctionSelect(discord.ui.Select):
         self.view.selected = self.values[0]
         await interaction.response.send_message(
             f"Da chon: {self.values[0]}",
+            ephemeral=True
+        )
+
+
+class BoneListSelect(discord.ui.Select):
+    def __init__(self, view, page):
+        self.parent_view = view
+        self.page = page
+        start = page * 25
+        chunk = view.bones_scanned[start:start + 25]
+
+        options = []
+        for i, b in enumerate(chunk):
+            idx = start + i
+            mark = "" if b["current"] == b["original"] else " [SUA]"
+            label = f"{idx + 1}. {b['original'][:60]}{mark}"[:100]
+            desc = b["current"][:100] if b["current"] != b["original"] else None
+            options.append(
+                discord.SelectOption(label=label, value=str(idx), description=desc)
+            )
+
+        if not options:
+            options = [discord.SelectOption(label="(trong)", value="-1")]
+
+        super().__init__(
+            placeholder=f"Chon bone (trang {page + 1})",
+            options=options
+        )
+
+    async def callback(self, interaction):
+        if self.values[0] == "-1":
+            await interaction.response.send_message(
+                "Khong co bone nao.", ephemeral=True
+            )
+            return
+        idx = int(self.values[0])
+        await interaction.response.send_modal(
+            BoneEditModal(self.parent_view, idx)
+        )
+
+
+class BoneEditorView(discord.ui.View):
+    def __init__(self, owner, filename, original, bones_scanned):
+        super().__init__(timeout=600)
+        self.owner = owner
+        self.filename = filename
+        self.original = original
+        self.bones_scanned = bones_scanned
+        self.page = 0
+        self.result = None
+        self._build()
+
+    def _build(self):
+        self.clear_items()
+        total_pages = max(1, (len(self.bones_scanned) + 24) // 25)
+        self.add_item(BoneListSelect(self, self.page))
+
+        prev_btn = discord.ui.Button(
+            label="<< Trang truoc", style=discord.ButtonStyle.secondary,
+            disabled=self.page <= 0, row=1
+        )
+        prev_btn.callback = self._prev
+        self.add_item(prev_btn)
+
+        info = discord.ui.Button(
+            label=f"Trang {self.page + 1}/{total_pages}",
+            style=discord.ButtonStyle.secondary,
+            disabled=True, row=1
+        )
+        self.add_item(info)
+
+        next_btn = discord.ui.Button(
+            label="Trang sau >>", style=discord.ButtonStyle.secondary,
+            disabled=self.page >= total_pages - 1, row=1
+        )
+        next_btn.callback = self._next
+        self.add_item(next_btn)
+
+        save_btn = discord.ui.Button(
+            label="LUU FILE", style=discord.ButtonStyle.success, row=2
+        )
+        save_btn.callback = self._save
+        self.add_item(save_btn)
+
+        reset_btn = discord.ui.Button(
+            label="RESET SUA", style=discord.ButtonStyle.danger, row=2
+        )
+        reset_btn.callback = self._reset
+        self.add_item(reset_btn)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner:
+            await interaction.response.send_message(
+                "Day khong phai phien lam viec cua ban.",
+                ephemeral=True
+            )
+            return False
+        return True
+
+    async def _prev(self, interaction):
+        if self.page > 0:
+            self.page -= 1
+        self._build()
+        await interaction.response.edit_message(view=self)
+
+    async def _next(self, interaction):
+        total_pages = max(1, (len(self.bones_scanned) + 24) // 25)
+        if self.page < total_pages - 1:
+            self.page += 1
+        self._build()
+        await interaction.response.edit_message(view=self)
+
+    async def _reset(self, interaction):
+        for b in self.bones_scanned:
+            b["current"] = b["original"]
+        self._build()
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(
+            "Da reset tat ca ve gia tri goc.", ephemeral=True
+        )
+
+    async def apply_bone_edit(self, interaction, index, new_name):
+        bone = self.bones_scanned[index]
+        old_name = bone["original"]
+        bone["current"] = new_name
+
+        self._build()
+        try:
+            await interaction.response.edit_message(view=self)
+        except Exception:
+            pass
+
+        len_info = ""
+        if len(new_name) != len(old_name):
+            len_info = f" (do dai {len(old_name)} -> {len(new_name)} byte)"
+
+        await interaction.followup.send(
+            f"Da ghi nho: '{old_name}' -> '{new_name}'{len_info}",
+            ephemeral=True
+        )
+
+    async def _save(self, interaction):
+        changed = [b for b in self.bones_scanned
+                   if b["current"] != b["original"]]
+        if not changed:
+            await interaction.response.send_message(
+                "Chua sua dong nao — khong co gi de luu.",
+                ephemeral=True
+            )
+            return
+
+        result = await asyncio.to_thread(
+            rebuild_with_replacements, self.original, changed
+        )
+        self.result = fix_checksum(result)
+
+        size_change = len(self.result) - len(self.original)
+        sign = "+" if size_change >= 0 else ""
+
+        file = discord.File(
+            io.BytesIO(self.result),
+            filename=self.filename
+        )
+
+        await interaction.response.send_message(
+            f"DA THAY {len(changed)} BONE\n"
+            f"Kich thuoc file: {len(self.original)} -> {len(self.result)} byte "
+            f"({sign}{size_change})\n"
+            f"File da tai xuong duoi.",
+            file=file,
             ephemeral=True
         )
 
@@ -334,7 +584,27 @@ class ToolView(discord.ui.View):
 
         function = self.selected
 
-        if function.startswith("scale") or function == "moveFull":
+        if function == "hexEditBone":
+            bones_scanned = await asyncio.to_thread(
+                scan_bone_names, self.original
+            )
+            if not bones_scanned:
+                await interaction.response.send_message(
+                    "Khong tim thay bone nao trong file.",
+                    ephemeral=True
+                )
+                return
+
+            view = BoneEditorView(
+                self.owner, self.filename, self.original, bones_scanned
+            )
+            await interaction.response.send_message(
+                f"Tim thay {len(bones_scanned)} bone trong file.\n"
+                f"Chon bone tu menu ben duoi de sua ten.",
+                view=view,
+                ephemeral=True
+            )
+        elif function.startswith("scale") or function == "moveFull":
             await interaction.response.send_modal(ValueModal(self, function))
         else:
             await self.run_function(interaction, function)
